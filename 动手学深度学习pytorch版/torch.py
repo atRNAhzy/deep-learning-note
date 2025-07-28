@@ -48,21 +48,43 @@ from torch.nn import functional as F
 from torchvision import transforms
 
 
+class EncoderBlock(nn.Module):
+    """Transformer编码器块"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
+                 dropout, use_bias=False, **kwargs):
+        super(EncoderBlock, self).__init__(**kwargs)
+        self.attention = d2l.MultiHeadAttention(
+            key_size, query_size, value_size, num_hiddens, num_heads, dropout,
+            use_bias)
+        self.addnorm1 = AddNorm(norm_shape, dropout)
+        self.ffn = PositionWiseFFN(
+            ffn_num_input, ffn_num_hiddens, num_hiddens)
+        self.addnorm2 = AddNorm(norm_shape, dropout)
+
+    def forward(self, X, valid_lens):
+        Y = self.addnorm1(X, self.attention(X, X, X, valid_lens))
+        return self.addnorm2(Y, self.ffn(Y))
+
+
 d2l.DATA_HUB['time_machine'] = (d2l.DATA_URL + 'timemachine.txt',
                                 '090b5e7e70c295757f55df93cb0a180b9691891a')
-
-txt_path = '/home/leaf/deep_learning/data/test_txt/百年孤独.txt'
-
-def read_txt():
-    with open(txt_path) as f:
-        lines = f.readlines()
-    return [re.sub('[^A-Za-z]+', ' ', line).strip().lower() for line in lines]  # 把所有非英文字母的字符全部变成空格，然后全部小写
-
 
 def read_time_machine():
     with open(d2l.download('time_machine'), 'r') as f:
         lines = f.readlines()
     return [re.sub('[^A-Za-z]+', ' ', line).strip().lower() for line in lines]  # 把所有非英文字母的字符全部变成空格，然后全部小写
+
+
+def load_corpus_time_machine(max_tokens=-1):
+    lines = read_time_machine()
+    tokens = tokenize(lines, 'char')
+    vocab = Vocab(tokens)
+    corpus = [vocab[token] for line in tokens for token in line]
+    if max_tokens > 0:
+        corpus = corpus[:max_tokens]
+    return corpus, vocab
+
 
 def seq_data_iter_random(corpus, batch_size, num_steps):
     corpus = corpus[random.randint(0, num_steps - 1):]
@@ -103,162 +125,21 @@ def seq_data_iter_sequential(corpus, batch_size, num_steps):
 class SeqDataLoader:
     def __init__(self, batch_size, num_steps, use_random_iter, max_tokens):
         if use_random_iter:
-            self.data_iter_fn = seq_data_iter_random
+            self.data_iter_fn = d2l.seq_data_iter_random
         else:
-            self.data_iter_fn = seq_data_iter_sequential
-        self.corpus, self.vocab = load_corpus_time_machine(max_tokens)
+            self.data_iter_fn = d2l.seq_data_iter_sequential
+        self.corpus, self.vocab = d2l.load_corpus_time_machine(max_tokens)
         self.batch_size, self.num_steps = batch_size, num_steps
 
     def __iter__(self):
         return self.data_iter_fn(self.corpus, self.batch_size, self.num_steps)
-    
 
-class SeqDataLoaderTXT:
-    def __init__(self, batch_size, num_steps, use_random_iter, max_tokens):
-        if use_random_iter:
-            self.data_iter_fn = seq_data_iter_random
-        else:
-            self.data_iter_fn = seq_data_iter_sequential
-        self.corpus, self.vocab = load_corpus_txt(max_tokens)
-        self.batch_size, self.num_steps = batch_size, num_steps
-
-    def __iter__(self):
-        return self.data_iter_fn(self.corpus, self.batch_size, self.num_steps)
-    
 def load_data_time_machine(batch_size, num_steps,
                            use_random_iter=False, max_tokens=10000):
     data_iter = SeqDataLoader(
         batch_size, num_steps, use_random_iter, max_tokens)
     return data_iter, data_iter.vocab
 
-
-def load_data_txt(batch_size, num_steps,
-                           use_random_iter=False, max_tokens=10000):
-    data_iter = SeqDataLoaderTXT(
-        batch_size, num_steps, use_random_iter, max_tokens)
-    return data_iter, data_iter.vocab
-
-class RNNModelScrath:
-    def __init__(self, vocab_size, num_hiddens, device,
-                 get_params, init_state, forward_fn):
-        self.vocab_size, self.num_hiddens = vocab_size, num_hiddens
-        self.params = get_params(vocab_size, num_hiddens, device)
-        self.init_state, self.forward_fn = init_state, forward_fn
-    
-    def __call__(self, X, state):
-        X = F.one_hot(X.T, self.vocab_size).type(torch.float32)
-        return self.forward_fn(X, state, self.params)
-    
-    def begin_state(self, batch_size, device):
-        return self.init_state(batch_size, self.num_hiddens, device)
-    
-
-def predict_ch8(prefix, num_preds, net, vocab, device):
-    state = net.begin_state(batch_size=1, device=device)
-    outputs = [vocab[prefix[0]]]
-    get_input = lambda: torch.tensor([outputs[-1]], device=device).reshape((1, 1))
-    for y in prefix[1:]:
-        _, state = net(get_input(), state)
-        outputs.append(vocab[y])    
-
-    for _ in range(num_preds):
-        y, state = net(get_input(), state)
-        outputs.append(int(y.argmax(dim=1).reshape(1)))
-    return ''.join([vocab.idx_to_token[i] for i in outputs])
-
-def grad_clipping(net, theta):
-    if isinstance(net, nn.Module):
-        params = [p for p in net.parameters() if p.requires_grad]
-    else:
-        params = net.params
-    norm = torch.sqrt(sum(torch.sum((p.grad ** 2)) for p in params))
-    if norm > theta:
-        for param in params:
-            param.grad[:] *= theta / norm
-    
-def train_epoch_ch8(net, train_iter, loss, updater, device, use_ramdom_iter):
-    state, timer = None, d2l.Timer()
-    metric = d2l.Accumulator(2)
-    for X, Y in train_iter:
-        if state is None or use_ramdom_iter:
-            state = net.begin_state(batch_size=X.shape[0], device=device)
-        else:
-            if isinstance(net, nn.Module) and not isinstance(state, tuple):
-                state.detach_()
-            else:
-                for s in state:
-                    s.detach_()
-        y = Y.T.reshape(-1)
-        X, y = X.to(device), y.to(device)
-        y_hat, state = net(X, state)
-        l = loss(y_hat, y.long()).mean()
-        if isinstance(updater, torch.optim.Optimizer):
-            updater.zero_grad()
-            l.backward()
-            grad_clipping(net, 1)
-            updater.step()
-        else:
-            l.backward()
-            grad_clipping(net, 1)
-            updater(batch_size=1)
-        metric.add(l * y.numel(), y.numel())
-    return math.exp(metric[0] / metric[1]), metric[1] / timer.stop()
-    
-def train_ch8(net, train_iter, vocab, lr, num_epochs, device,
-              use_random_iter=False):
-    loss = nn.CrossEntropyLoss()
-    animator = d2l.Animator(xlabel='epoch', ylabel='perplexity',
-                            legend=['train'], xlim=[10, num_epochs])
-    
-    if isinstance(net, nn.Module):
-        updater = torch.optim.SGD(net.parameters(), lr)
-    else:
-        updater = lambda batch_size: d2l.sgd(net.params, lr, batch_size)
-    predict = lambda prefix: predict_ch8(prefix, 50, net, vocab, device)
-    for epoch in range(num_epochs):
-        ppl, speed = train_epoch_ch8(
-            net, train_iter, loss, updater, device, use_random_iter)
-        if (epoch + 1) % 10 == 0:
-            print(predict('time traveller'))
-            animator.add(epoch + 1, [ppl])
-    print(f'困惑度{ppl:.1f}, {speed:.1f} 词元/秒 {str(device)}')
-    print(predict('time traveller'))
-    print(predict('traveller'))
-
-
-class RNNModel(nn.Module):
-    def __init__(self, rnn_layer, vocab_size, **kwargs):
-        super(RNNModel, self).__init__(**kwargs)
-        self.rnn = rnn_layer
-        self.vocab_size = vocab_size
-        self.num_hiddens = self.rnn.hidden_size
-
-        if not self.rnn.bidirectional:
-            self.num_directions = 1
-            self.linear = nn.Linear(self.num_hiddens, self.vocab_size)
-        else:
-            self.num_directions = 2
-            self.linear = nn.Linear(self.num_hiddens * 2, self.vocab_size)
-
-    def forward(self, inputs, state):
-        X = F.one_hot(inputs.T.long(), self.vocab_size)
-        X = X.to(torch.float32)
-        Y, state = self.rnn(X, state)
-        output = self.linear(Y.reshape((-1, Y.shape[-1])))
-        return output, state
-    
-    def begin_state(self, device, batch_size=1):
-        if not isinstance(self.rnn, nn.LSTM):
-            return torch.zeros((self.num_directions * self.rnn.num_layers,
-                                batch_size, self.num_hiddens),
-                                device=device)
-        else:
-            return (torch.zeros((
-                        self.num_directions * self.rnn.num_layers,
-                        batch_size, self.num_hiddens), device=device),
-                    torch.zeros((
-                        self.num_directions * self.rnn.num_layers,
-                        batch_size, self.num_hiddens), device=device))
 
 def use_svg_display():
     """Use the svg format to display a plot in Jupyter.
@@ -887,25 +768,6 @@ class TimeMachine(d2l.DataModule):
             self.num_train, self.num_train + self.num_val)
         return self.get_tensorloader([self.X, self.Y], train, idx)
 
-    
-def load_corpus_txt(max_tokens=-1):
-    lines = read_txt()
-    tokens = tokenize(lines, 'char')
-    vocab = Vocab(tokens)
-    corpus = [vocab[token] for line in tokens for token in line]
-    if max_tokens > 0:
-        corpus = corpus[:max_tokens]
-    return corpus, vocab
-
-def load_corpus_time_machine(max_tokens=-1):
-    lines = read_time_machine()
-    tokens = tokenize(lines, 'char')
-    vocab = Vocab(tokens)
-    corpus = [vocab[token] for line in tokens for token in line]
-    if max_tokens > 0:
-        corpus = corpus[:max_tokens]
-    return corpus, vocab
-
 class Vocab:
     """Vocabulary for text."""
     def __init__(self, tokens=[], min_freq=0, reserved_tokens=[]):
@@ -918,12 +780,8 @@ class Vocab:
         self.token_freqs = sorted(counter.items(), key=lambda x: x[1],
                                   reverse=True)
         # The list of unique tokens
-        unk = ['<unk>']
-        if tokens and isinstance(tokens[0], tuple):
-            unk = []
-        self.idx_to_token = list(sorted(
-            set(unk + reserved_tokens + 
-                [token for token, freq in self.token_freqs if freq >= min_freq])))
+        self.idx_to_token = list(sorted(set(['<unk>'] + reserved_tokens + [
+            token for token, freq in self.token_freqs if freq >= min_freq])))
         self.token_to_idx = {token: idx
                              for idx, token in enumerate(self.idx_to_token)}
 
@@ -1183,38 +1041,19 @@ class Decoder(nn.Module):
 
     def forward(self, X, state):
         raise NotImplementedError
-
-class EncoderDecoder(d2l.Classifier):
-    """The base class for the encoder--decoder architecture.
-
-    Defined in :numref:`sec_encoder-decoder`"""
-    def __init__(self, encoder, decoder):
-        super().__init__()
+class EncoderDecoder(nn.Module):
+    """编码器-解码器架构的基类"""
+    def __init__(self, encoder, decoder, **kwargs):
+        super(EncoderDecoder, self).__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
 
     def forward(self, enc_X, dec_X, *args):
-        enc_all_outputs = self.encoder(enc_X, *args)
-        dec_state = self.decoder.init_state(enc_all_outputs, *args)
-        # Return decoder output only
-        return self.decoder(dec_X, dec_state)[0]
+        enc_outputs = self.encoder(enc_X, *args)
+        dec_state = self.decoder.init_state(enc_outputs, *args)
+        return self.decoder(dec_X, dec_state)
 
-    def predict_step(self, batch, device, num_steps,
-                     save_attention_weights=False):
-        """Defined in :numref:`sec_seq2seq_training`"""
-        batch = [d2l.to(a, device) for a in batch]
-        src, tgt, src_valid_len, _ = batch
-        enc_all_outputs = self.encoder(src, src_valid_len)
-        dec_state = self.decoder.init_state(enc_all_outputs, src_valid_len)
-        outputs, attention_weights = [d2l.expand_dims(tgt[:, 0], 1), ], []
-        for _ in range(num_steps):
-            Y, dec_state = self.decoder(outputs[-1], dec_state)
-            outputs.append(d2l.argmax(Y, 2))
-            # Save attention weights (to be covered later)
-            if save_attention_weights:
-                attention_weights.append(self.decoder.attention_weights)
-        return d2l.concat(outputs[1:], 1), attention_weights
-
+        
 def init_seq2seq(module):
     """Initialize weights for sequence-to-sequence learning.
 
@@ -1382,67 +1221,67 @@ class AttentionDecoder(d2l.Decoder):
     def attention_weights(self):
         raise NotImplementedError
 
-class MultiHeadAttention(d2l.Module):
-    """Multi-head attention.
+#@save
+def transpose_qkv(X, num_heads):
+    """为了多注意力头的并行计算而变换形状"""
+    # 输入X的形状:(batch_size，查询或者“键－值”对的个数，num_hiddens)
+    # 输出X的形状:(batch_size，查询或者“键－值”对的个数，num_heads，
+    # num_hiddens/num_heads)
+    X = X.reshape(X.shape[0], X.shape[1], num_heads, -1)
 
-    Defined in :numref:`sec_multihead-attention`"""
-    def __init__(self, num_hiddens, num_heads, dropout, bias=False, **kwargs):
-        super().__init__()
+    # 输出X的形状:(batch_size，num_heads，查询或者“键－值”对的个数,
+    # num_hiddens/num_heads)
+    X = X.permute(0, 2, 1, 3)
+
+    # 最终输出的形状:(batch_size*num_heads,查询或者“键－值”对的个数,
+    # num_hiddens/num_heads)
+    return X.reshape(-1, X.shape[2], X.shape[3])
+
+
+#@save
+def transpose_output(X, num_heads):
+    """逆转transpose_qkv函数的操作"""
+    X = X.reshape(-1, num_heads, X.shape[1], X.shape[2])
+    X = X.permute(0, 2, 1, 3)
+    return X.reshape(X.shape[0], X.shape[1], -1)
+
+class MultiHeadAttention(nn.Module):
+    """多头注意力"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 num_heads, dropout, bias=False, **kwargs):
+        super(MultiHeadAttention, self).__init__(**kwargs)
         self.num_heads = num_heads
         self.attention = d2l.DotProductAttention(dropout)
-        self.W_q = nn.LazyLinear(num_hiddens, bias=bias)
-        self.W_k = nn.LazyLinear(num_hiddens, bias=bias)
-        self.W_v = nn.LazyLinear(num_hiddens, bias=bias)
-        self.W_o = nn.LazyLinear(num_hiddens, bias=bias)
+        self.W_q = nn.Linear(query_size, num_hiddens, bias=bias)
+        self.W_k = nn.Linear(key_size, num_hiddens, bias=bias)
+        self.W_v = nn.Linear(value_size, num_hiddens, bias=bias)
+        self.W_o = nn.Linear(num_hiddens, num_hiddens, bias=bias)
 
     def forward(self, queries, keys, values, valid_lens):
-        # Shape of queries, keys, or values:
-        # (batch_size, no. of queries or key-value pairs, num_hiddens)
-        # Shape of valid_lens: (batch_size,) or (batch_size, no. of queries)
-        # After transposing, shape of output queries, keys, or values:
-        # (batch_size * num_heads, no. of queries or key-value pairs,
-        # num_hiddens / num_heads)
-        queries = self.transpose_qkv(self.W_q(queries))
-        keys = self.transpose_qkv(self.W_k(keys))
-        values = self.transpose_qkv(self.W_v(values))
+        # queries，keys，values的形状:
+        # (batch_size，查询或者“键－值”对的个数，num_hiddens)
+        # valid_lens　的形状:
+        # (batch_size，)或(batch_size，查询的个数)
+        # 经过变换后，输出的queries，keys，values　的形状:
+        # (batch_size*num_heads，查询或者“键－值”对的个数，
+        # num_hiddens/num_heads)
+        queries = transpose_qkv(self.W_q(queries), self.num_heads)
+        keys = transpose_qkv(self.W_k(keys), self.num_heads)
+        values = transpose_qkv(self.W_v(values), self.num_heads)
 
         if valid_lens is not None:
-            # On axis 0, copy the first item (scalar or vector) for num_heads
-            # times, then copy the next item, and so on
+            # 在轴0，将第一项（标量或者矢量）复制num_heads次，
+            # 然后如此复制第二项，然后诸如此类。
             valid_lens = torch.repeat_interleave(
                 valid_lens, repeats=self.num_heads, dim=0)
 
-        # Shape of output: (batch_size * num_heads, no. of queries,
-        # num_hiddens / num_heads)
+        # output的形状:(batch_size*num_heads，查询的个数，
+        # num_hiddens/num_heads)
         output = self.attention(queries, keys, values, valid_lens)
-        # Shape of output_concat: (batch_size, no. of queries, num_hiddens)
-        output_concat = self.transpose_output(output)
+
+        # output_concat的形状:(batch_size，查询的个数，num_hiddens)
+        output_concat = transpose_output(output, self.num_heads)
         return self.W_o(output_concat)
-
-    def transpose_qkv(self, X):
-        """Transposition for parallel computation of multiple attention heads.
-    
-        Defined in :numref:`sec_multihead-attention`"""
-        # Shape of input X: (batch_size, no. of queries or key-value pairs,
-        # num_hiddens). Shape of output X: (batch_size, no. of queries or
-        # key-value pairs, num_heads, num_hiddens / num_heads)
-        X = X.reshape(X.shape[0], X.shape[1], self.num_heads, -1)
-        # Shape of output X: (batch_size, num_heads, no. of queries or key-value
-        # pairs, num_hiddens / num_heads)
-        X = X.permute(0, 2, 1, 3)
-        # Shape of output: (batch_size * num_heads, no. of queries or key-value
-        # pairs, num_hiddens / num_heads)
-        return X.reshape(-1, X.shape[2], X.shape[3])
-    
-
-    def transpose_output(self, X):
-        """Reverse the operation of transpose_qkv.
-    
-        Defined in :numref:`sec_multihead-attention`"""
-        X = X.reshape(-1, self.num_heads, X.shape[1], X.shape[2])
-        X = X.permute(0, 2, 1, 3)
-        return X.reshape(X.shape[0], X.shape[1], -1)
-
 class PositionalEncoding(nn.Module):
     """Positional encoding.
 
@@ -1463,14 +1302,13 @@ class PositionalEncoding(nn.Module):
         return self.dropout(X)
 
 class PositionWiseFFN(nn.Module):
-    """The positionwise feed-forward network.
-
-    Defined in :numref:`sec_transformer`"""
-    def __init__(self, ffn_num_hiddens, ffn_num_outputs):
-        super().__init__()
-        self.dense1 = nn.LazyLinear(ffn_num_hiddens)
+    """基于位置的前馈网络"""
+    def __init__(self, ffn_num_input, ffn_num_hiddens, ffn_num_outputs,
+                 **kwargs):
+        super(PositionWiseFFN, self).__init__(**kwargs)
+        self.dense1 = nn.Linear(ffn_num_input, ffn_num_hiddens)
         self.relu = nn.ReLU()
-        self.dense2 = nn.LazyLinear(ffn_num_outputs)
+        self.dense2 = nn.Linear(ffn_num_hiddens, ffn_num_outputs)
 
     def forward(self, X):
         return self.dense2(self.relu(self.dense1(X)))
@@ -2432,107 +2270,106 @@ def get_tokens_and_segments(tokens_a, tokens_b=None):
     return tokens, segments
 
 class BERTEncoder(nn.Module):
-    """BERT encoder.
-
-    Defined in :numref:`subsec_bert_input_rep`"""
-    def __init__(self, vocab_size, num_hiddens, ffn_num_hiddens, num_heads,
-                 num_blks, dropout, max_len=1000, **kwargs):
-        super(BERTEncoder, self).__init__(**kwargs)
-        self.token_embedding = nn.Embedding(vocab_size, num_hiddens)
-        self.segment_embedding = nn.Embedding(2, num_hiddens)
-        self.blks = nn.Sequential()
-        for i in range(num_blks):
-            self.blks.add_module(f"{i}", d2l.TransformerEncoderBlock(
-                num_hiddens, ffn_num_hiddens, num_heads, dropout, True))
-        # In BERT, positional embeddings are learnable, thus we create a
-        # parameter of positional embeddings that are long enough
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_len,
-                                                      num_hiddens))
-
+    def __init__(self, vocab_size, num_hiddens, norm_shape, ffn_num_input,
+                 ffn_num_hiddens, num_heads, num_layers, dropout,
+                 max_len=1000, key_size=768, query_size=768, value_size=768,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.token_embedding = nn.Embedding(vocab_size, num_hiddens) # 词嵌入
+        self.segment_embedding = nn.Embedding(2, num_hiddens) # 段嵌入
+        self.blks = nn.Sequential() # 编码块
+        for i in range(num_layers):
+            self.blks.add_module(f"{i}", EncoderBlock(
+                key_size, query_size, value_size, num_hiddens, norm_shape,
+                ffn_num_input, ffn_num_hiddens, num_heads, dropout, True))
+            
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, num_hiddens))
+    
     def forward(self, tokens, segments, valid_lens):
-        # Shape of `X` remains unchanged in the following code snippet:
-        # (batch size, max sequence length, `num_hiddens`)
+        # embedding
         X = self.token_embedding(tokens) + self.segment_embedding(segments)
-        X = X + self.pos_embedding[:, :X.shape[1], :]
+        X = X + self.pos_embedding.data[:, :X.shape[1], :]
+        
         for blk in self.blks:
             X = blk(X, valid_lens)
         return X
 
-class MaskLM(nn.Module):
-    """The masked language model task of BERT.
 
-    Defined in :numref:`subsec_bert_input_rep`"""
-    def __init__(self, vocab_size, num_hiddens, **kwargs):
+#@save
+class MaskLM(nn.Module):
+    """BERT的掩蔽语言模型任务"""
+    def __init__(self, vocab_size, num_hiddens, num_inputs=768, **kwargs):
         super(MaskLM, self).__init__(**kwargs)
-        self.mlp = nn.Sequential(nn.LazyLinear(num_hiddens),
+        self.mlp = nn.Sequential(nn.Linear(num_inputs, num_hiddens),
                                  nn.ReLU(),
                                  nn.LayerNorm(num_hiddens),
-                                 nn.LazyLinear(vocab_size))
+                                 nn.Linear(num_hiddens, vocab_size))
 
     def forward(self, X, pred_positions):
         num_pred_positions = pred_positions.shape[1]
         pred_positions = pred_positions.reshape(-1)
         batch_size = X.shape[0]
         batch_idx = torch.arange(0, batch_size)
-        # Suppose that `batch_size` = 2, `num_pred_positions` = 3, then
-        # `batch_idx` is `torch.tensor([0, 0, 0, 1, 1, 1])`
+        # 假设batch_size=2，num_pred_positions=3
+        # 那么batch_idx是np.array（[0,0,0,1,1,1]）
         batch_idx = torch.repeat_interleave(batch_idx, num_pred_positions)
         masked_X = X[batch_idx, pred_positions]
         masked_X = masked_X.reshape((batch_size, num_pred_positions, -1))
         mlm_Y_hat = self.mlp(masked_X)
         return mlm_Y_hat
 
+#@save
 class NextSentencePred(nn.Module):
-    """The next sentence prediction task of BERT.
-
-    Defined in :numref:`subsec_mlm`"""
-    def __init__(self, **kwargs):
+    """BERT的下一句预测任务"""
+    def __init__(self, num_inputs, **kwargs):
         super(NextSentencePred, self).__init__(**kwargs)
-        self.output = nn.LazyLinear(2)
+        self.output = nn.Linear(num_inputs, 2)
 
     def forward(self, X):
-        # `X` shape: (batch size, `num_hiddens`)
+        # X的形状：(batchsize,num_hiddens)
         return self.output(X)
 
 class BERTModel(nn.Module):
-    """The BERT model.
-
-    Defined in :numref:`subsec_nsp`"""
-    def __init__(self, vocab_size, num_hiddens, ffn_num_hiddens,
-                 num_heads, num_blks, dropout, max_len=1000):
-        super(BERTModel, self).__init__()
-        self.encoder = BERTEncoder(vocab_size, num_hiddens, ffn_num_hiddens,
-                                   num_heads, num_blks, dropout,
-                                   max_len=max_len)
-        self.hidden = nn.Sequential(nn.LazyLinear(num_hiddens),
+    def __init__(self, vocab_size, num_hiddens, norm_shape, ffn_num_input,
+                 ffn_num_hiddens, num_heads, num_layers, dropout,
+                 max_len=1000, key_size=768, query_size=768, value_size=768,
+                 hid_in_features=768, mlm_in_features=768,
+                 nsp_in_features=768):
+        super().__init__()
+        self.encoder = BERTEncoder(vocab_size, num_hiddens, norm_shape,
+                                   ffn_num_input, ffn_num_hiddens, num_heads, num_layers,
+                                   dropout, max_len=max_len, key_size=key_size,
+                                   query_size=query_size, value_size=value_size)
+        self.hidden = nn.Sequential(nn.Linear(hid_in_features, num_hiddens),
                                     nn.Tanh())
-        self.mlm = MaskLM(vocab_size, num_hiddens)
-        self.nsp = NextSentencePred()
-
-    def forward(self, tokens, segments, valid_lens=None, pred_positions=None):
+        self.mlm = MaskLM(vocab_size, num_hiddens, mlm_in_features)
+        self.nsp = NextSentencePred(nsp_in_features)
+    
+    def forward(self, tokens, segments, valid_lens=None,
+                pred_positions=None):
         encoded_X = self.encoder(tokens, segments, valid_lens)
         if pred_positions is not None:
             mlm_Y_hat = self.mlm(encoded_X, pred_positions)
         else:
             mlm_Y_hat = None
-        # The hidden layer of the MLP classifier for next sentence prediction.
-        # 0 is the index of the '<cls>' token
-        nsp_Y_hat = self.nsp(self.hidden(encoded_X[:, 0, :]))
+
+        nsp_Y_hat = self.nsp(self.hidden(encoded_X[:, 0, :])) # 每个句子的第一个字符<cls>用于分类
         return encoded_X, mlm_Y_hat, nsp_Y_hat
+
 
 d2l.DATA_HUB['wikitext-2'] = (
     'https://s3.amazonaws.com/research.metamind.io/wikitext/'
     'wikitext-2-v1.zip', '3c914d17d80b1459be871a5039ac23e752a53cbe')
 
 def _read_wiki(data_dir):
-    """Defined in :numref:`sec_bert-dataset`"""
-    file_name = os.path.join(data_dir, 'wiki.train.tokens')
-    with open(file_name, 'r') as f:
-        lines = f.readlines()
-    # Uppercase letters are converted to lowercase ones
+    df = pd.read_parquet(data_dir)
+    print(df.columns)
+    # 提取文本内容列并转换为列表
+    lines = df['text'].tolist()
+    print("reading")
     paragraphs = [line.strip().lower().split(' . ')
-                  for line in lines if len(line.split(' . ')) >= 2]
-    random.shuffle(paragraphs)
+                for line in lines if len(line.split(' . ')) >= 2]
+    random.shuffle(paragraphs) # 在段落间进行打乱
     return paragraphs
 
 def _get_next_sentence(sentence, next_sentence, paragraphs):
@@ -2636,51 +2473,46 @@ def _pad_bert_inputs(examples, max_len, vocab):
             all_mlm_weights, all_mlm_labels, nsp_labels)
 
 class _WikiTextDataset(torch.utils.data.Dataset):
-    """Defined in :numref:`subsec_prepare_mlm_data`"""
     def __init__(self, paragraphs, max_len):
-        # Input `paragraphs[i]` is a list of sentence strings representing a
-        # paragraph; while output `paragraphs[i]` is a list of sentences
-        # representing a paragraph, where each sentence is a list of tokens
+        super().__init__()
         paragraphs = [d2l.tokenize(
             paragraph, token='word') for paragraph in paragraphs]
         sentences = [sentence for paragraph in paragraphs
                      for sentence in paragraph]
         self.vocab = d2l.Vocab(sentences, min_freq=5, reserved_tokens=[
             '<pad>', '<mask>', '<cls>', '<sep>'])
-        # Get data for the next sentence prediction task
         examples = []
         for paragraph in paragraphs:
             examples.extend(_get_nsp_data_from_paragraph(
                 paragraph, paragraphs, self.vocab, max_len))
-        # Get data for the masked language model task
         examples = [(_get_mlm_data_from_tokens(tokens, self.vocab)
-                      + (segments, is_next))
+                     + (segments, is_next))
                      for tokens, segments, is_next in examples]
-        # Pad inputs
         (self.all_token_ids, self.all_segments, self.valid_lens,
          self.all_pred_positions, self.all_mlm_weights,
          self.all_mlm_labels, self.nsp_labels) = _pad_bert_inputs(
-            examples, max_len, self.vocab)
-
+             examples, max_len, self.vocab)
+    
     def __getitem__(self, idx):
         return (self.all_token_ids[idx], self.all_segments[idx],
                 self.valid_lens[idx], self.all_pred_positions[idx],
                 self.all_mlm_weights[idx], self.all_mlm_labels[idx],
                 self.nsp_labels[idx])
-
+    
     def __len__(self):
         return len(self.all_token_ids)
 
-def load_data_wiki(batch_size, max_len):
-    """Load the WikiText-2 dataset.
 
-    Defined in :numref:`subsec_prepare_mlm_data`"""
+def load_data_wiki(batch_size, max_len):
     num_workers = d2l.get_dataloader_workers()
-    data_dir = d2l.download_extract('wikitext-2', 'wikitext-2')
-    paragraphs = _read_wiki(data_dir)
-    train_set = _WikiTextDataset(paragraphs, max_len)
+    paragraphs = _read_wiki("../data/wiki/train-00000-of-00001.parquet")
+    train_set = _WikiTextDataset(paragraphs, max_len)#返回数据集
     train_iter = torch.utils.data.DataLoader(train_set, batch_size,
-                                        shuffle=True, num_workers=num_workers)
+    shuffle=True, num_workers=0)
+    print("down")
+
+    print(train_set.vocab)
+    #每次取这么多个样本
     return train_iter, train_set.vocab
 
 def _get_batch_loss_bert(net, loss, vocab_size, tokens_X,
