@@ -1,0 +1,33 @@
+{
+  "best_ind": [
+    32.0,
+    0.0004541853761256251,
+    0.0844006341065573,
+    1.0,
+    0.0,
+    1.0,
+    0.0
+  ],
+  "best_cfg": {
+    "batch_size": 32,
+    "lr": 0.0004541853761256251,
+    "dropout_rate": 0.0844006341065573,
+    "num_cnn_layers": 3,
+    "kernel_size": 3,
+    "pooling_type": "max",
+    "num_linear_layers": 2,
+    "use_bn_cnn": true,
+    "use_dropout_cnn": false,
+    "use_bn_linear": true,
+    "use_dropout_linear": false
+  },
+  "fitness_at_selection": 1.1186559658050537,
+  "best_test_loss": 1.1186559658050537,
+  "ga_params": {
+    "POP_SIZE": 12,
+    "NGEN": 10,
+    "CXPB": 0.8,
+    "MUTPB": 0.5,
+    "TOURN_SIZE": 2
+  }
+}
